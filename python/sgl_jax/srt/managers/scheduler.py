@@ -249,7 +249,18 @@ class Scheduler(
 
         # init distribution
         if self.nnodes > 1:
-            jax.distributed.initialize(server_args.dist_init_addr, self.nnodes, self.node_rank)
+            dist_timeout = server_args.dist_timeout or 1800  # 30min for large model loading
+            logger.info(
+                "JAX distributed init: addr=%s, nnodes=%s, rank=%s, "
+                "init_timeout=%s, heartbeat_timeout=%s",
+                server_args.dist_init_addr, self.nnodes, self.node_rank,
+                dist_timeout, dist_timeout,
+            )
+            jax.distributed.initialize(
+                server_args.dist_init_addr, self.nnodes, self.node_rank,
+                initialization_timeout=dist_timeout,
+                heartbeat_timeout_seconds=dist_timeout,
+            )
 
         platform = os.getenv("JAX_PLATFORMS", None)
         if platform == "proxy":

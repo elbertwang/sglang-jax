@@ -320,9 +320,9 @@ class MHATokenToKVPool(KVCache):
             total_memory_per_layer / GB,
             self.dtype,
         )
-        with self.mesh:
+        with jax.set_mesh(self.mesh):
             self.kv_buffer = []
-            for _ in range(self.layer_num):
+            for i in range(self.layer_num):
                 kv_buf = jax.jit(
                     lambda: jnp.zeros(
                         shape=fused_buffer_shape,
@@ -330,8 +330,9 @@ class MHATokenToKVPool(KVCache):
                     ),
                     out_shardings=self.kv_sharding,
                 )()
-
                 self.kv_buffer.append(kv_buf)
+                if i == 0:
+                    logger.info("KV buffer layer 0 created successfully, shape=%s", kv_buf.shape)
 
         end_time = time.time()
         logger.info(

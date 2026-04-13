@@ -29,6 +29,61 @@ if not hasattr(np, "float8_e5m2"):
     np.float8_e5m2 = ml_dtypes.float8_e5m2
 
 
+def blockwise_dequant_fp8_jax(weight_fp8: jax.Array, scale_inv: jax.Array, block_size: int = 128) -> jax.Array:
+    """Block-wise FP8→BF16 dequantization using JAX ops (works with distributed arrays).
+
+    Args:
+        weight_fp8: [out, in] FP8 weight (before transpose)
+        scale_inv: [ceil(out/block), ceil(in/block)] float32 quantization scale
+            Despite the name "scale_inv", this is actually the quantization scale.
+            Dequant formula: w_bf16 = w_fp8 / scale_inv
+        block_size: quantization block size (default 128)
+    Returns:
+        [out, in] bfloat16 weight
+    """
+    out_dim, in_dim = weight_fp8.shape
+    w = weight_fp8.astype(jnp.float32)
+
+    out_blocks = (out_dim + block_size - 1) // block_size
+    in_blocks = (in_dim + block_size - 1) // block_size
+
+    pad_out = out_blocks * block_size - out_dim
+    pad_in = in_blocks * block_size - in_dim
+    if pad_out > 0 or pad_in > 0:
+        w = jnp.pad(w, ((0, pad_out), (0, pad_in)))
+
+    w = w.reshape(out_blocks, block_size, in_blocks, block_size)
+    s = scale_inv[:out_blocks, :in_blocks].astype(jnp.float32)
+    w = w / s[:, None, :, None]
+
+    w = w.reshape(out_blocks * block_size, in_blocks * block_size)
+    return w[:out_dim, :in_dim].astype(jnp.bfloat16)
+
+
+def blockwise_dequant_fp8_np(weight_fp8: np.ndarray, scale_inv: np.ndarray, block_size: int = 128) -> np.ndarray:
+    """Block-wise FP8→BF16 dequantization using numpy (for per-expert MoE loading).
+
+    Dequant formula: w_bf16 = w_fp8 / scale_inv
+    """
+    out_dim, in_dim = weight_fp8.shape
+    w = weight_fp8.astype(np.float32)
+
+    out_blocks = (out_dim + block_size - 1) // block_size
+    in_blocks = (in_dim + block_size - 1) // block_size
+
+    pad_out = out_blocks * block_size - out_dim
+    pad_in = in_blocks * block_size - in_dim
+    if pad_out > 0 or pad_in > 0:
+        w = np.pad(w, ((0, pad_out), (0, pad_in)))
+
+    w = w.reshape(out_blocks, block_size, in_blocks, block_size)
+    s = scale_inv[:out_blocks, :in_blocks].astype(np.float32)
+    w = w / s[:, None, :, None]
+
+    w = w.reshape(out_blocks * block_size, in_blocks * block_size)
+    return w[:out_dim, :in_dim]
+
+
 def _view_as_fp8_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> np.ndarray:
     if data.dtype == np.uint8:
         if target_dtype == jnp.float8_e4m3fn:
@@ -577,6 +632,7 @@ class WeightLoader:
         do_transpose: bool = False,
         target_sharding: jax.sharding.NamedSharding = None,
         physical_to_logical_map: np.ndarray | None = None,
+        dequant_fp8: bool = False,
     ) -> jax.Array:
         first_key = expected_hf_keys[0]
         info = weight_info[first_key][0]
@@ -606,6 +662,28 @@ class WeightLoader:
         else:
             num_physical_experts = num_logical_experts
 
+        # Check if FP8 dequant is needed
+        if dequant_fp8 and target_dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+            # Build scale key mapping: hf_key → scale_key
+            scale_key_map = {}
+            for hf_key in expected_hf_keys:
+                sk = hf_key + "_scale_inv"
+                if sk in weight_info:
+                    scale_key_map[hf_key] = sk
+            do_dequant = len(scale_key_map) > 0
+            logger.info("MoE FP8 dequant: %s, scale_keys found: %d/%d, first_key: %s",
+                        do_dequant, len(scale_key_map), len(expected_hf_keys),
+                        expected_hf_keys[0] if expected_hf_keys else "N/A")
+            if do_dequant:
+                # Output dtype becomes bfloat16 after dequant
+                output_dtype = ml_dtypes.bfloat16
+            else:
+                do_dequant = False
+                output_dtype = target_dtype
+        else:
+            do_dequant = False
+            output_dtype = target_dtype
+
         if do_transpose and len(single_expert_shape) >= 2:
             final_single_shape = list(single_expert_shape)
             final_single_shape[-1], final_single_shape[-2] = (
@@ -619,7 +697,7 @@ class WeightLoader:
         stacked_shape = (num_physical_experts, *final_single_shape)
         sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
 
-        LOAD_WORKERS = 16
+        LOAD_WORKERS = 64
 
         def _load_stacked_slice(index):
             expert_slice = index[0]
@@ -646,18 +724,42 @@ class WeightLoader:
             else:
                 logical_indices_to_load = physical_indices
 
+            # Pre-load all scales for this batch of experts (same file, small tensors)
+            preloaded_scales = {}
+            if do_dequant:
+                for log_idx in set(logical_indices_to_load):
+                    hf_key_tmp = expected_hf_keys[log_idx]
+                    if hf_key_tmp in scale_key_map:
+                        sk = scale_key_map[hf_key_tmp]
+                        if sk not in preloaded_scales:
+                            sf = file_manager.get_handle(weight_info[sk][0]["file"])
+                            preloaded_scales[sk] = sf.get_slice(sk)[:]
+
+            def _load_expert_data(hf_key):
+                """Load a single expert weight, optionally dequant FP8."""
+                fname = weight_info[hf_key][0]["file"]
+                f = file_manager.get_handle(fname)
+                if not do_dequant or hf_key not in scale_key_map:
+                    if not do_transpose:
+                        data = f.get_slice(hf_key)[inner_slice]
+                        return _view_as_fp8_if_needed(data, target_dtype)
+                    else:
+                        data = f.get_slice(hf_key)[:]
+                        data = _view_as_fp8_if_needed(data, target_dtype)
+                        return np.transpose(data)[inner_slice]
+                # Dequant: read full, dequant, transpose, slice
+                data = f.get_slice(hf_key)[:]
+                data = _view_as_fp8_if_needed(data, target_dtype)
+                sk = scale_key_map[hf_key]
+                data = blockwise_dequant_fp8_np(data, preloaded_scales[sk], block_size=128)
+                data = data.astype(output_dtype)
+                if do_transpose:
+                    data = np.transpose(data)
+                return data[inner_slice]
+
             first_log_idx = logical_indices_to_load[0]
             first_hf_key = expected_hf_keys[first_log_idx]
-            first_fname = weight_info[first_hf_key][0]["file"]
-            first_f = file_manager.get_handle(first_fname)
-
-            if not do_transpose:
-                first_chunk = first_f.get_slice(first_hf_key)[inner_slice]
-                first_chunk = _view_as_fp8_if_needed(first_chunk, target_dtype)
-            else:
-                data = first_f.get_slice(first_hf_key)[:]
-                data = _view_as_fp8_if_needed(data, target_dtype)
-                first_chunk = np.transpose(data)[inner_slice]
+            first_chunk = _load_expert_data(first_hf_key)
 
             out_shape = (sliced_num_physical, *first_chunk.shape)
             out_array = np.empty(out_shape, dtype=first_chunk.dtype)
@@ -674,16 +776,7 @@ class WeightLoader:
             def load_and_fill_expert(args):
                 l_idx, positions = args
                 hf_k = expected_hf_keys[l_idx]
-                fname = weight_info[hf_k][0]["file"]
-                f = file_manager.get_handle(fname)
-
-                if not do_transpose:
-                    chunk = f.get_slice(hf_k)[inner_slice]
-                    chunk = _view_as_fp8_if_needed(chunk, target_dtype)
-                else:
-                    data = f.get_slice(hf_k)[:]
-                    data = _view_as_fp8_if_needed(data, target_dtype)
-                    chunk = np.transpose(data)[inner_slice]
+                chunk = _load_expert_data(hf_k)
 
                 for pos in positions:
                     out_array[pos] = chunk
@@ -695,8 +788,9 @@ class WeightLoader:
 
             return out_array
 
+        result_dtype = jnp.bfloat16 if do_dequant else target_dtype
         return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
-            target_dtype
+            result_dtype
         )
 
     def load_weights_from_safetensors(
@@ -820,6 +914,49 @@ class WeightLoader:
                             )
                             lazy_weight = lazy_arrays[0]
 
+                        # FP8 block-wise dequantization: apply scale_inv before transpose
+                        # Weight is in HF format [out, in], scale_inv is [out_blocks, in_blocks]
+                        if lazy_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                            target_path_tmp = mapping.target_path
+                            model_param_tmp = self._get_param(params, target_path_tmp)
+                            target_is_fp8 = model_param_tmp.value.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]
+
+                            if not target_is_fp8:
+                                # Target is BF16 (LinearBase.weight) — need dequant
+                                scale_key = hf_key + "_scale_inv"
+                                if scale_key in weight_info:
+                                    # Load scale (small, replicated)
+                                    scale_infos = weight_info[scale_key]
+                                    scale_f = file_manager.get_handle(scale_infos[0]["file"])
+                                    scale_np = scale_f.get_slice(scale_key)[:]
+
+                                    # Load weight, dequant, then create sharded array via callback
+                                    w_info = infos[0]
+                                    w_shape = w_info["shape"]
+
+                                    # Determine FP8 dtype from safetensors metadata
+                                    st_dtype_str = w_info.get("dtype", "F8_E4M3")
+                                    fp8_dtype_map = {"F8_E4M3": jnp.float8_e4m3fn, "F8_E5M2": jnp.float8_e5m2}
+                                    fp8_target = fp8_dtype_map.get(st_dtype_str, jnp.float8_e4m3fn)
+
+                                    def _make_dequant_callback(hk=hf_key, si=scale_np, fm=file_manager, wi=w_info, td=fp8_target):
+                                        def _load_dequant_slice(index):
+                                            f = fm.get_handle(wi["file"])
+                                            data = f.get_slice(hk)[:]
+                                            data = _view_as_fp8_if_needed(data, td)
+                                            data = blockwise_dequant_fp8_np(data, si, block_size=128)
+                                            return data.astype(ml_dtypes.bfloat16)[index]
+                                        return _load_dequant_slice
+
+                                    lazy_weight = jax.make_array_from_callback(
+                                        w_shape, final_sharding, _make_dequant_callback(),
+                                    )
+                                    logger.debug("FP8 dequant: %s (scale %s)", hf_key, scale_key)
+                                else:
+                                    # No scale found, just cast (embedding, lm_head etc.)
+                                    lazy_weight = lazy_weight.astype(jnp.bfloat16)
+                                    logger.debug("FP8 cast (no scale): %s", hf_key)
+
                         # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
                         if mapping.transpose_axes is not None:
                             lazy_weight = jnp.transpose(lazy_weight, mapping.transpose_axes)
@@ -836,11 +973,7 @@ class WeightLoader:
 
                         target_path = mapping.target_path
                         model_param = self._get_param(params, target_path)
-
-                        if lazy_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
-                            model_param.value = lazy_weight
-                        else:
-                            model_param.value = lazy_weight.astype(model_param.value.dtype)
+                        model_param.value = lazy_weight.astype(model_param.value.dtype)
 
                         mode_str = "Split-Stitch" if is_split_weight else "Direct"
                         logger.debug(
@@ -941,7 +1074,10 @@ class WeightLoader:
                         # Standard Sharding
                         final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
 
-                    # 2. Call creator
+                    # 2. Call creator (with FP8 dequant if target param is BF16)
+                    target_path_moe = mapping.target_path[0]
+                    model_param_moe = self._get_param(params, target_path_moe)
+                    need_dequant = model_param_moe.value.dtype not in [jnp.float8_e4m3fn, jnp.float8_e5m2]
                     stacked_weight = self._create_stacked_moe_lazy_tensor(
                         expected_hf_keys,
                         weight_info,
@@ -949,6 +1085,7 @@ class WeightLoader:
                         do_transpose=mapping.transpose,  # CPU transpose
                         target_sharding=final_sharding,  # Global loading
                         physical_to_logical_map=mapping.physical_to_logical_map,
+                        dequant_fp8=need_dequant,
                     )
                     loaded_shape = stacked_weight.shape
 
@@ -978,10 +1115,10 @@ class WeightLoader:
                         )
 
                     try:
-                        if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
-                            model_param.value = stacked_weight
-                        else:
+                        if stacked_weight.dtype != model_param.value.dtype:
                             model_param.value = stacked_weight.astype(model_param.value.dtype)
+                        else:
+                            model_param.value = stacked_weight
                     except Exception as e:
                         logger.error(
                             "Failed MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
