@@ -256,10 +256,11 @@ class JAXModelLoader(DefaultModelLoader):
                     if model_config.quantization_config.get_linear_rules():
                         model = apply_linear_quantization(model_config, model, is_static_input=True)
                 else:
-                    logger.info("Dynamic quantization detected. Skipping structure change in loader.")
+                    logger.info("Dynamic quantization detected. Will re-quant after weight loading.")
             else:
                 logger.info("No quantization config found. Skipping quantization.")
         model.load_weights(model_config)
+        # Dynamic quantization is handled by model_runner.py after model initialization
         return model
 
 

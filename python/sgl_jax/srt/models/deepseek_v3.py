@@ -399,6 +399,7 @@ class DeepseekV3DecoderLayer(nnx.Module):
                 num_experts=num_experts,
                 weight_dtype=dtype,
                 score_func="sigmoid",
+                enable_expert_bias=True,
             )
             self.topk = TopK(
                 topk=num_experts_per_tok,
@@ -507,7 +508,10 @@ class DeepseekV3DecoderLayer(nnx.Module):
 
             # Routed experts
             router_logits = self.moe_gate(hidden_states)
-            topk_weights, topk_ids = self.topk(router_logits, dispatch_info=dispatch_info)
+            correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
+            topk_weights, topk_ids = self.topk(
+                router_logits, correction_bias=correction_bias, dispatch_info=dispatch_info
+            )
 
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
@@ -607,9 +611,9 @@ class DeepseekV3ForCausalLM(nnx.Module):
         self.config = config
         self.dtype = dtype
 
-        # Disable FP8 quantization auto-detection.
-        if hasattr(config, "quantization_config"):
-            config.quantization_config = None
+        # Note: quantization_config is NOT disabled.
+        # If --quantization-config-path is provided, loader will apply quantization
+        # after weight loading (dynamic per-channel FP8 re-quant).
 
         # Override head_dim for MLA: FlashAttention and KV cache use this.
         # MLA qk_head_dim=192 padded to 256 (128-aligned for TPU Pallas kernels).
@@ -777,6 +781,12 @@ class DeepseekV3ForCausalLM(nnx.Module):
                 target_path=f"{target_prefix}.moe_gate.kernel",
                 sharding=(None, None),
                 transpose=True,
+            )
+            # Expert score correction bias
+            mappings[f"{prefix}.mlp.gate.e_score_correction_bias"] = WeightMapping(
+                target_path=f"{target_prefix}.moe_gate.bias",
+                sharding=(None,),
+                transpose=False,
             )
 
             # Shared experts (quantized)
