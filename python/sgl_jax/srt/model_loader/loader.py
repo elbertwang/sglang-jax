@@ -266,14 +266,15 @@ class JAXModelLoader(DefaultModelLoader):
             try:
                 import orbax.checkpoint as ocp
                 checkpointer = ocp.StandardCheckpointer()
-                if os.path.exists(ckpt_path) or ckpt_path.startswith("gs://"):
+                ckpt_exists = os.path.exists(os.path.join(ckpt_path, "_METADATA"))
+                if ckpt_exists:
                     # Try restore
                     try:
                         logger.info("Restoring model from checkpoint: %s", ckpt_path)
                         abstract_state = nnx.state(model)
                         restored_state = checkpointer.restore(
                             ckpt_path,
-                            args=ocp.args.StandardRestore(abstract_state),
+                            target=abstract_state,
                         )
                         nnx.update(model, restored_state)
                         logger.info("Checkpoint restore complete! Skipped weight loading.")
