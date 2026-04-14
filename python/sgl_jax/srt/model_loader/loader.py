@@ -259,7 +259,45 @@ class JAXModelLoader(DefaultModelLoader):
                     logger.info("Dynamic quantization detected. Will re-quant after weight loading.")
             else:
                 logger.info("No quantization config found. Skipping quantization.")
+        # Try to restore from orbax checkpoint for fast loading
+        ckpt_dir = os.environ.get("SGLANG_CHECKPOINT_DIR")
+        if ckpt_dir:
+            ckpt_path = os.path.join(ckpt_dir, "model_state")
+            try:
+                import orbax.checkpoint as ocp
+                checkpointer = ocp.StandardCheckpointer()
+                if os.path.exists(ckpt_path) or ckpt_path.startswith("gs://"):
+                    # Try restore
+                    try:
+                        logger.info("Restoring model from checkpoint: %s", ckpt_path)
+                        abstract_state = nnx.state(model)
+                        restored_state = checkpointer.restore(
+                            ckpt_path,
+                            args=ocp.args.StandardRestore(abstract_state),
+                        )
+                        nnx.update(model, restored_state)
+                        logger.info("Checkpoint restore complete! Skipped weight loading.")
+                        return model
+                    except Exception as e:
+                        logger.warning("Checkpoint restore failed: %s. Falling back to normal loading.", e)
+            except ImportError:
+                logger.warning("orbax not available, skipping checkpoint restore.")
+
         model.load_weights(model_config)
+
+        # Save checkpoint for fast future loading
+        if ckpt_dir:
+            try:
+                import orbax.checkpoint as ocp
+                ckpt_path = os.path.join(ckpt_dir, "model_state")
+                logger.info("Saving model checkpoint to: %s", ckpt_path)
+                checkpointer = ocp.StandardCheckpointer()
+                state = nnx.state(model)
+                checkpointer.save(ckpt_path, state, force=True)
+                logger.info("Checkpoint saved successfully!")
+            except Exception as e:
+                logger.warning("Checkpoint save failed: %s", e)
+
         # Dynamic quantization is handled by model_runner.py after model initialization
         return model
 
