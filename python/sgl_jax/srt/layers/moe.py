@@ -40,12 +40,11 @@ class GateLogit(nnx.Module):
         )
         if enable_expert_bias:
             self.bias = nnx.Param(
-                jax.random.normal(
-                    jax.random.PRNGKey(0),
+                jnp.zeros(
                     (num_experts,),
                     dtype=self.weight_dtype,
-                    out_sharding=P(None),
                 ),
+                out_sharding=P(None),
             )
         else:
             self.bias = None
