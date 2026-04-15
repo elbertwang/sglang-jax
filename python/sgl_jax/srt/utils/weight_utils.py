@@ -697,7 +697,7 @@ class WeightLoader:
         stacked_shape = (num_physical_experts, *final_single_shape)
         sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
 
-        LOAD_WORKERS = 64
+        LOAD_WORKERS = int(os.environ.get("SGLANG_LOAD_WORKERS", "4"))
 
         def _load_stacked_slice(index):
             expert_slice = index[0]
@@ -761,10 +761,14 @@ class WeightLoader:
                 hf_shape = weight_info[hf_key][0]["shape"]
                 
                 def get_enclosing_slice(s, max_dim):
+                    if s.start in (None, 0) and s.stop in (None, max_dim):
+                        return slice(None)
                     start = s.start or 0
                     stop = s.stop if s.stop is not None else max_dim
                     aligned_start = (start // block_size) * block_size
                     aligned_stop = min(((stop + block_size - 1) // block_size) * block_size, max_dim)
+                    if aligned_start == 0 and aligned_stop == max_dim:
+                        return slice(None)
                     return slice(aligned_start, aligned_stop)
                 
                 sk = scale_key_map[hf_key]
@@ -775,7 +779,10 @@ class WeightLoader:
                 enclosing_slice = (s0, s1)
                 
                 # Read aligned chunk
-                data = f.get_slice(hf_key)[enclosing_slice]
+                if s0 == slice(None) and s1 == slice(None):
+                    data = f.get_tensor(hf_key)
+                else:
+                    data = f.get_slice(hf_key)[enclosing_slice]
                 data = _view_as_fp8_if_needed(data, target_dtype)
                 
                 # Extract scale slice
@@ -987,10 +994,14 @@ class WeightLoader:
                                             hf_shape = wi["shape"]
 
                                             def get_enclosing_slice(s, max_dim):
+                                                if s.start in (None, 0) and s.stop in (None, max_dim):
+                                                    return slice(None)
                                                 start = s.start or 0
                                                 stop = s.stop if s.stop is not None else max_dim
                                                 aligned_start = (start // block_size) * block_size
                                                 aligned_stop = min(((stop + block_size - 1) // block_size) * block_size, max_dim)
+                                                if aligned_start == 0 and aligned_stop == max_dim:
+                                                    return slice(None)
                                                 return slice(aligned_start, aligned_stop)
 
                                             s0 = get_enclosing_slice(index[0], hf_shape[0])
@@ -998,7 +1009,10 @@ class WeightLoader:
                                             enclosing_slice = (s0, s1)
 
                                             # Read aligned chunk
-                                            data = f.get_slice(hk)[enclosing_slice]
+                                            if s0 == slice(None) and s1 == slice(None):
+                                                data = f.get_tensor(hk)
+                                            else:
+                                                data = f.get_slice(hk)[enclosing_slice]
                                             data = _view_as_fp8_if_needed(data, td)
 
                                             # Extract scale slice
