@@ -523,16 +523,17 @@ class DeepseekV3DecoderLayer(nnx.Module):
             routed_output = self.mlp(hidden_states, topk_weights, topk_ids)
 
             if _MOE_DEBUG and self.layer_id < 3:
-                jax.debug.print(
-                    "MOE_FWD layer={layer} router_mean={rm} router_max={rx} "
-                    "topk_w_mean={tw} routed_norm={rn} shared_norm={sn}",
-                    layer=self.layer_id,
-                    rm=jnp.mean(router_logits),
-                    rx=jnp.max(router_logits),
-                    tw=jnp.mean(topk_weights),
-                    rn=jnp.mean(jnp.abs(routed_output)),
-                    sn=jnp.mean(jnp.abs(shared_output)),
-                )
+                _lid = self.layer_id
+                def _log_moe(rm, rx, tw, rn, sn):
+                    logger.info(
+                        "MOE_FWD layer=%d router_mean=%.4f router_max=%.4f "
+                        "topk_w_mean=%.4f routed_norm=%.4f shared_norm=%.4f",
+                        _lid, float(rm), float(rx), float(tw), float(rn), float(sn))
+                jax.debug.callback(_log_moe,
+                    jnp.mean(router_logits), jnp.max(router_logits),
+                    jnp.mean(topk_weights),
+                    jnp.mean(jnp.abs(routed_output)),
+                    jnp.mean(jnp.abs(shared_output)))
 
             hidden_states = routed_output + shared_output
         else:
@@ -608,12 +609,14 @@ class DeepseekV3Model(nnx.Module):
             layers_topk_ids.append(topk_ids)
 
             if _MOE_DEBUG and (i < 5 or i % 20 == 0):
-                jax.debug.print(
-                    "FWD_DEBUG layer={layer} hs_norm={hn} res_norm={rn}",
-                    layer=i,
-                    hn=jnp.mean(jnp.abs(hidden_states)),
-                    rn=jnp.mean(jnp.abs(residual)) if residual is not None else 0.0,
-                )
+                _layer_i = i
+                _is_moe = layer.is_moe
+                def _log_fwd(hn, rn):
+                    logger.info("FWD_DEBUG layer=%d hs_norm=%.6f res_norm=%.6f is_moe=%s",
+                                _layer_i, float(hn), float(rn), _is_moe)
+                jax.debug.callback(_log_fwd,
+                    jnp.mean(jnp.abs(hidden_states)),
+                    jnp.mean(jnp.abs(residual)) if residual is not None else jnp.float32(0.0))
 
         if residual is not None:
             hidden_states += residual
