@@ -15,6 +15,7 @@ Architecture:
 
 import logging
 import math
+import os
 from typing import Any
 
 import jax
@@ -22,6 +23,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from transformers import PretrainedConfig
+
+_MOE_DEBUG = os.environ.get("SGLANG_MOE_DEBUG", "0") == "1"
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
@@ -518,6 +521,19 @@ class DeepseekV3DecoderLayer(nnx.Module):
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
             routed_output = self.mlp(hidden_states, topk_weights, topk_ids)
+
+            if _MOE_DEBUG and self.layer_id < 3:
+                logger.info(
+                    "MOE_FWD layer=%d router_logits: mean=%.4f max=%.4f topk_w: mean=%.4f "
+                    "topk_ids[0]=%s routed_norm=%.4f shared_norm=%.4f",
+                    self.layer_id,
+                    float(jnp.mean(router_logits)), float(jnp.max(router_logits)),
+                    float(jnp.mean(topk_weights)),
+                    str(topk_ids[0].tolist()[:4]) if topk_ids.shape[0] > 0 else "[]",
+                    float(jnp.mean(jnp.abs(routed_output))),
+                    float(jnp.mean(jnp.abs(shared_output))),
+                )
+
             hidden_states = routed_output + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
@@ -579,7 +595,7 @@ class DeepseekV3Model(nnx.Module):
         layers_kv_fused = []
         layers_topk_ids = []
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             hidden_states, residual, kv_fused, topk_ids = layer(
                 forward_batch.positions,
                 hidden_states,
@@ -590,6 +606,14 @@ class DeepseekV3Model(nnx.Module):
             )
             layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
+
+            if _MOE_DEBUG and (i < 5 or i % 20 == 0):
+                hs_norm = float(jnp.mean(jnp.abs(hidden_states)))
+                res_norm = float(jnp.mean(jnp.abs(residual))) if residual is not None else 0
+                logger.info(
+                    "FWD_DEBUG layer=%d hs_norm=%.4f res_norm=%.4f is_moe=%s",
+                    i, hs_norm, res_norm, layer.is_moe,
+                )
 
         if residual is not None:
             hidden_states += residual
@@ -646,6 +670,45 @@ class DeepseekV3ForCausalLM(nnx.Module):
         weight_mappings = self._create_weight_mappings()
         loader.load_weights_from_safetensors(weight_mappings)
         logger.info("DeepseekV3 weights loaded successfully!")
+
+        if _MOE_DEBUG:
+            self._debug_weight_stats()
+
+    def _debug_weight_stats(self):
+        """Print weight statistics for debugging MoE issues."""
+        first_k = getattr(self.config, "first_k_dense_replace", 1)
+        # Check a few MoE layers
+        for li in [first_k, first_k + 1, 30, 60]:
+            if li >= len(self.model.layers):
+                continue
+            layer = self.model.layers[li]
+            if not layer.is_moe:
+                continue
+            # Gate weights
+            gate_k = layer.moe_gate.kernel.value
+            gate_stats = f"gate: mean={float(jnp.mean(gate_k)):.4f} std={float(jnp.std(gate_k)):.4f} max={float(jnp.max(jnp.abs(gate_k))):.4f}"
+            # Bias
+            if layer.moe_gate.bias is not None:
+                bias_v = layer.moe_gate.bias.value
+                bias_stats = f"bias: mean={float(jnp.mean(bias_v)):.4f} max={float(jnp.max(jnp.abs(bias_v))):.4f}"
+            else:
+                bias_stats = "bias: None"
+            # Expert weights (check first shard)
+            mlp = layer.mlp
+            wi0 = mlp.wi_0.value
+            wi1 = mlp.wi_1.value
+            wo = mlp.wo.value
+            wi0_stats = f"wi0: dtype={wi0.dtype} mean={float(jnp.mean(jnp.abs(wi0))):.6f} max={float(jnp.max(jnp.abs(wi0))):.4f}"
+            wi1_stats = f"wi1: dtype={wi1.dtype} mean={float(jnp.mean(jnp.abs(wi1))):.6f} max={float(jnp.max(jnp.abs(wi1))):.4f}"
+            wo_stats = f"wo: dtype={wo.dtype} mean={float(jnp.mean(jnp.abs(wo))):.6f} max={float(jnp.max(jnp.abs(wo))):.4f}"
+            # Shared experts
+            sh = layer.shared_experts
+            sh_gate = sh.gate_proj.weight.value
+            sh_stats = f"shared_gate: mean={float(jnp.mean(jnp.abs(sh_gate))):.6f} max={float(jnp.max(jnp.abs(sh_gate))):.4f}"
+            logger.info(
+                "MOE_DEBUG layer=%d %s %s %s %s %s %s",
+                li, gate_stats, bias_stats, wi0_stats, wi1_stats, wo_stats, sh_stats,
+            )
 
     def _create_weight_mappings(self) -> dict:
         mappings = {
