@@ -523,15 +523,15 @@ class DeepseekV3DecoderLayer(nnx.Module):
             routed_output = self.mlp(hidden_states, topk_weights, topk_ids)
 
             if _MOE_DEBUG and self.layer_id < 3:
-                logger.info(
-                    "MOE_FWD layer=%d router_logits: mean=%.4f max=%.4f topk_w: mean=%.4f "
-                    "topk_ids[0]=%s routed_norm=%.4f shared_norm=%.4f",
-                    self.layer_id,
-                    float(jnp.mean(router_logits)), float(jnp.max(router_logits)),
-                    float(jnp.mean(topk_weights)),
-                    str(topk_ids[0].tolist()[:4]) if topk_ids.shape[0] > 0 else "[]",
-                    float(jnp.mean(jnp.abs(routed_output))),
-                    float(jnp.mean(jnp.abs(shared_output))),
+                jax.debug.print(
+                    "MOE_FWD layer={layer} router_mean={rm} router_max={rx} "
+                    "topk_w_mean={tw} routed_norm={rn} shared_norm={sn}",
+                    layer=self.layer_id,
+                    rm=jnp.mean(router_logits),
+                    rx=jnp.max(router_logits),
+                    tw=jnp.mean(topk_weights),
+                    rn=jnp.mean(jnp.abs(routed_output)),
+                    sn=jnp.mean(jnp.abs(shared_output)),
                 )
 
             hidden_states = routed_output + shared_output
@@ -608,11 +608,11 @@ class DeepseekV3Model(nnx.Module):
             layers_topk_ids.append(topk_ids)
 
             if _MOE_DEBUG and (i < 5 or i % 20 == 0):
-                hs_norm = float(jnp.mean(jnp.abs(hidden_states)))
-                res_norm = float(jnp.mean(jnp.abs(residual))) if residual is not None else 0
-                logger.info(
-                    "FWD_DEBUG layer=%d hs_norm=%.4f res_norm=%.4f is_moe=%s",
-                    i, hs_norm, res_norm, layer.is_moe,
+                jax.debug.print(
+                    "FWD_DEBUG layer={layer} hs_norm={hn} res_norm={rn}",
+                    layer=i,
+                    hn=jnp.mean(jnp.abs(hidden_states)),
+                    rn=jnp.mean(jnp.abs(residual)) if residual is not None else 0.0,
                 )
 
         if residual is not None:
