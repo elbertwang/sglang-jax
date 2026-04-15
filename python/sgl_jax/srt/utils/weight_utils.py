@@ -785,18 +785,27 @@ class WeightLoader:
                     data = f.get_slice(hf_key)[enclosing_slice]
                 data = _view_as_fp8_if_needed(data, target_dtype)
                 
-                # Extract scale slice
-                scale_s0 = slice(s0.start // block_size, (s0.stop + block_size - 1) // block_size)
-                scale_s1 = slice(s1.start // block_size, (s1.stop + block_size - 1) // block_size)
+                # Extract scale slice (handle slice(None) = full dimension)
+                def _moe_scale_slice(s, max_dim):
+                    if s == slice(None) or (s.start is None and s.stop is None):
+                        return slice(None)
+                    st = s.start or 0
+                    sp = s.stop if s.stop is not None else max_dim
+                    return slice(st // block_size, (sp + block_size - 1) // block_size)
+
+                scale_s0 = _moe_scale_slice(s0, hf_shape[0])
+                scale_s1 = _moe_scale_slice(s1, hf_shape[1])
                 scale_inv_sliced = scale_inv_full[scale_s0, scale_s1]
-                
+
                 # Dequantize aligned chunk
                 data = blockwise_dequant_fp8_np(data, scale_inv_sliced, block_size=block_size)
-                
-                # Extract requested slice from the memory chunk
-                start0 = (hf_slice[0].start or 0) - s0.start
+
+                # Extract requested slice from the aligned chunk
+                s0_start = s0.start if s0 != slice(None) and s0.start is not None else 0
+                s1_start = s1.start if s1 != slice(None) and s1.start is not None else 0
+                start0 = (hf_slice[0].start or 0) - s0_start
                 stop0 = start0 + ((hf_slice[0].stop if hf_slice[0].stop is not None else hf_shape[0]) - (hf_slice[0].start or 0))
-                start1 = (hf_slice[1].start or 0) - s1.start
+                start1 = (hf_slice[1].start or 0) - s1_start
                 stop1 = start1 + ((hf_slice[1].stop if hf_slice[1].stop is not None else hf_shape[1]) - (hf_slice[1].start or 0))
                 
                 data = data[start0:stop0, start1:stop1]
