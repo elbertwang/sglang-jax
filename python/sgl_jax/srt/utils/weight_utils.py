@@ -942,10 +942,23 @@ class WeightLoader:
                                     def _make_dequant_callback(hk=hf_key, si=scale_np, fm=file_manager, wi=w_info, td=fp8_target):
                                         def _load_dequant_slice(index):
                                             f = fm.get_handle(wi["file"])
-                                            data = f.get_slice(hk)[:]
+                                            data = f.get_slice(hk)[index]
                                             data = _view_as_fp8_if_needed(data, td)
-                                            data = blockwise_dequant_fp8_np(data, si, block_size=128)
-                                            return data.astype(ml_dtypes.bfloat16)[index]
+                                            
+                                            block_size = 128
+                                            def get_block_slice(s, max_dim):
+                                                start = s.start or 0
+                                                stop = s.stop if s.stop is not None else max_dim
+                                                assert start % block_size == 0, f"Slice start {start} not aligned to {block_size}"
+                                                return slice(start // block_size, (stop + block_size - 1) // block_size)
+                                            
+                                            hf_shape = wi["shape"]
+                                            s0 = get_block_slice(index[0], hf_shape[0])
+                                            s1 = get_block_slice(index[1], hf_shape[1])
+                                            scale_inv_sliced = si[s0, s1]
+                                            
+                                            data = blockwise_dequant_fp8_np(data, scale_inv_sliced, block_size=128)
+                                            return data.astype(ml_dtypes.bfloat16)
                                         return _load_dequant_slice
 
                                     lazy_weight = jax.make_array_from_callback(
