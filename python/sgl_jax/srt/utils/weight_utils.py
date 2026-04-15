@@ -739,6 +739,15 @@ class WeightLoader:
                 """Load a single expert weight, optionally dequant FP8."""
                 fname = weight_info[hf_key][0]["file"]
                 f = file_manager.get_handle(fname)
+                
+                # Determine the slice to read from HF file
+                if do_transpose and len(inner_slice) >= 2:
+                    hf_slice = list(inner_slice)
+                    hf_slice[-1], hf_slice[-2] = hf_slice[-2], hf_slice[-1]
+                    hf_slice = tuple(hf_slice)
+                else:
+                    hf_slice = inner_slice
+                    
                 if not do_dequant or hf_key not in scale_key_map:
                     if not do_transpose:
                         data = f.get_slice(hf_key)[inner_slice]
@@ -747,15 +756,47 @@ class WeightLoader:
                         data = f.get_slice(hf_key)[:]
                         data = _view_as_fp8_if_needed(data, target_dtype)
                         return np.transpose(data)[inner_slice]
-                # Dequant: read full, dequant, transpose, slice
-                data = f.get_slice(hf_key)[:]
-                data = _view_as_fp8_if_needed(data, target_dtype)
+                
+                block_size = 128
+                hf_shape = weight_info[hf_key][0]["shape"]
+                
+                def get_enclosing_slice(s, max_dim):
+                    start = s.start or 0
+                    stop = s.stop if s.stop is not None else max_dim
+                    aligned_start = (start // block_size) * block_size
+                    aligned_stop = min(((stop + block_size - 1) // block_size) * block_size, max_dim)
+                    return slice(aligned_start, aligned_stop)
+                
                 sk = scale_key_map[hf_key]
-                data = blockwise_dequant_fp8_np(data, preloaded_scales[sk], block_size=128)
+                scale_inv_full = preloaded_scales[sk]
+                
+                s0 = get_enclosing_slice(hf_slice[0], hf_shape[0])
+                s1 = get_enclosing_slice(hf_slice[1], hf_shape[1])
+                enclosing_slice = (s0, s1)
+                
+                # Read aligned chunk
+                data = f.get_slice(hf_key)[enclosing_slice]
+                data = _view_as_fp8_if_needed(data, target_dtype)
+                
+                # Extract scale slice
+                scale_s0 = slice(s0.start // block_size, (s0.stop + block_size - 1) // block_size)
+                scale_s1 = slice(s1.start // block_size, (s1.stop + block_size - 1) // block_size)
+                scale_inv_sliced = scale_inv_full[scale_s0, scale_s1]
+                
+                # Dequantize aligned chunk
+                data = blockwise_dequant_fp8_np(data, scale_inv_sliced, block_size=block_size)
+                
+                # Extract requested slice from the memory chunk
+                start0 = (hf_slice[0].start or 0) - s0.start
+                stop0 = start0 + ((hf_slice[0].stop if hf_slice[0].stop is not None else hf_shape[0]) - (hf_slice[0].start or 0))
+                start1 = (hf_slice[1].start or 0) - s1.start
+                stop1 = start1 + ((hf_slice[1].stop if hf_slice[1].stop is not None else hf_shape[1]) - (hf_slice[1].start or 0))
+                
+                data = data[start0:stop0, start1:stop1]
                 data = data.astype(output_dtype)
                 if do_transpose:
                     data = np.transpose(data)
-                return data[inner_slice]
+                return data
 
             first_log_idx = logical_indices_to_load[0]
             first_hf_key = expected_hf_keys[first_log_idx]
@@ -942,22 +983,39 @@ class WeightLoader:
                                     def _make_dequant_callback(hk=hf_key, si=scale_np, fm=file_manager, wi=w_info, td=fp8_target):
                                         def _load_dequant_slice(index):
                                             f = fm.get_handle(wi["file"])
-                                            data = f.get_slice(hk)[index]
-                                            data = _view_as_fp8_if_needed(data, td)
-                                            
                                             block_size = 128
-                                            def get_block_slice(s, max_dim):
+                                            hf_shape = wi["shape"]
+
+                                            def get_enclosing_slice(s, max_dim):
                                                 start = s.start or 0
                                                 stop = s.stop if s.stop is not None else max_dim
-                                                assert start % block_size == 0, f"Slice start {start} not aligned to {block_size}"
-                                                return slice(start // block_size, (stop + block_size - 1) // block_size)
-                                            
-                                            hf_shape = wi["shape"]
-                                            s0 = get_block_slice(index[0], hf_shape[0])
-                                            s1 = get_block_slice(index[1], hf_shape[1])
-                                            scale_inv_sliced = si[s0, s1]
-                                            
-                                            data = blockwise_dequant_fp8_np(data, scale_inv_sliced, block_size=128)
+                                                aligned_start = (start // block_size) * block_size
+                                                aligned_stop = min(((stop + block_size - 1) // block_size) * block_size, max_dim)
+                                                return slice(aligned_start, aligned_stop)
+
+                                            s0 = get_enclosing_slice(index[0], hf_shape[0])
+                                            s1 = get_enclosing_slice(index[1], hf_shape[1])
+                                            enclosing_slice = (s0, s1)
+
+                                            # Read aligned chunk
+                                            data = f.get_slice(hk)[enclosing_slice]
+                                            data = _view_as_fp8_if_needed(data, td)
+
+                                            # Extract scale slice
+                                            scale_s0 = slice(s0.start // block_size, (s0.stop + block_size - 1) // block_size)
+                                            scale_s1 = slice(s1.start // block_size, (s1.stop + block_size - 1) // block_size)
+                                            scale_inv_sliced = si[scale_s0, scale_s1]
+
+                                            # Dequantize aligned chunk
+                                            data = blockwise_dequant_fp8_np(data, scale_inv_sliced, block_size=block_size)
+
+                                            # Extract requested slice from the memory chunk
+                                            start0 = (index[0].start or 0) - s0.start
+                                            stop0 = start0 + ((index[0].stop if index[0].stop is not None else hf_shape[0]) - (index[0].start or 0))
+                                            start1 = (index[1].start or 0) - s1.start
+                                            stop1 = start1 + ((index[1].stop if index[1].stop is not None else hf_shape[1]) - (index[1].start or 0))
+
+                                            data = data[start0:stop0, start1:stop1]
                                             return data.astype(ml_dtypes.bfloat16)
                                         return _load_dequant_slice
 
