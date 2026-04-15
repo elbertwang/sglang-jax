@@ -52,6 +52,32 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 
 logger = logging.getLogger(__name__)
 
+_moe_debug_count = 0
+
+def _do_moe_fwd_debug(output, cache_miss_count):
+    global _moe_debug_count
+    _moe_debug_count += 1
+    if _moe_debug_count > 5:
+        return
+    try:
+        # output is LogitsProcessorOutput — check logits
+        logits = output.next_token_logits
+        if logits is not None:
+            logits_np = np.array(logits)
+            top5_idx = np.argsort(logits_np[0])[-5:][::-1]
+            top5_vals = logits_np[0][top5_idx]
+            logger.info(
+                "LOGITS_DEBUG call=%d shape=%s dtype=%s mean=%.4f std=%.4f "
+                "min=%.4f max=%.4f top5_ids=%s top5_vals=%s cache_miss=%d",
+                _moe_debug_count, logits_np.shape, logits_np.dtype,
+                float(logits_np.mean()), float(logits_np.std()),
+                float(logits_np.min()), float(logits_np.max()),
+                top5_idx.tolist(), [f"{v:.2f}" for v in top5_vals],
+                cache_miss_count,
+            )
+    except Exception as e:
+        logger.warning("LOGITS_DEBUG error: %s", e)
+
 
 class ModelRunner(BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
@@ -598,6 +624,10 @@ class ModelRunner(BaseModelRunner):
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
+
+        if os.environ.get("SGLANG_MOE_DEBUG") == "1":
+            _do_moe_fwd_debug(output, cache_miss_count)
+
         self._set_kv_cache_after_forward(layers_kv_fused)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
