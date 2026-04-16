@@ -1,3 +1,5 @@
+import os
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
