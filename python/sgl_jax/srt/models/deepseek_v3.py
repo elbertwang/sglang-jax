@@ -525,6 +525,20 @@ class DeepseekV3DecoderLayer(nnx.Module):
             else:
                 routed_output = self.mlp(hidden_states, topk_weights, topk_ids)
 
+            if _MOE_DEBUG and self.layer_id < 3:
+                _lid = self.layer_id
+                def _log_norms(rn, sn, hn):
+                    logger.info("MOE_NORMS layer=%d routed=%.6f shared=%.6f input=%.6f ratio=%.2f",
+                                _lid, float(rn), float(sn), float(hn),
+                                float(rn) / max(float(sn), 1e-10))
+                jax.experimental.io_callback(
+                    _log_norms,
+                    None,  # no return
+                    jnp.mean(jnp.abs(routed_output)),
+                    jnp.mean(jnp.abs(shared_output)),
+                    jnp.mean(jnp.abs(hidden_states)),
+                )
+
             hidden_states = routed_output + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
