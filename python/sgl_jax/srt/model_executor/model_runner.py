@@ -647,6 +647,16 @@ class ModelRunner(BaseModelRunner):
 
         if os.environ.get("SGLANG_MOE_DEBUG") == "1":
             _do_moe_fwd_debug(output, cache_miss_count)
+            # Check per-layer hidden state norms (saved by model during forward pass)
+            if hasattr(self, 'model') and hasattr(self.model, 'model') and hasattr(self.model.model, '_debug_norms'):
+                try:
+                    norms = self.model.model._debug_norms
+                    shard = norms.addressable_shards[0]
+                    norms_np = np.array(shard.data).astype(np.float32)
+                    logger.info("LAYER_NORMS call=%d values=%s", _moe_debug_count,
+                                str([round(float(v), 4) for v in norms_np]))
+                except Exception as e:
+                    logger.warning("LAYER_NORMS error: %s", e)
 
         self._set_kv_cache_after_forward(layers_kv_fused)
 

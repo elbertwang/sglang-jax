@@ -588,6 +588,9 @@ class DeepseekV3Model(nnx.Module):
         layers_kv_fused = []
         layers_topk_ids = []
 
+        # Collect per-layer norms for debugging (cheap: only scalar reductions)
+        debug_norms = [] if _MOE_DEBUG else None
+
         for i, layer in enumerate(self.layers):
             hidden_states, residual, kv_fused, topk_ids = layer(
                 forward_batch.positions,
@@ -600,19 +603,15 @@ class DeepseekV3Model(nnx.Module):
             layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
 
-            if _MOE_DEBUG and (i < 5 or i % 20 == 0):
-                _layer_i = i
-                _is_moe = layer.is_moe
-                def _log_fwd(hn, rn):
-                    logger.info("FWD_DEBUG layer=%d hs_norm=%.6f res_norm=%.6f is_moe=%s",
-                                _layer_i, float(hn), float(rn), _is_moe)
-                jax.debug.callback(_log_fwd,
-                    jnp.mean(jnp.abs(hidden_states)),
-                    jnp.mean(jnp.abs(residual)) if residual is not None else jnp.float32(0.0))
+            if debug_norms is not None and (i < 5 or i % 10 == 0 or i == len(self.layers) - 1):
+                debug_norms.append(jnp.mean(jnp.abs(hidden_states)))
 
         if residual is not None:
             hidden_states += residual
         hidden_states = self.norm(hidden_states)
+
+        if debug_norms is not None:
+            self._debug_norms = jnp.stack(debug_norms)
 
         return hidden_states, layers_kv_fused, layers_topk_ids
 
