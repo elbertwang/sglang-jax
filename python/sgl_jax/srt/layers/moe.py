@@ -519,6 +519,9 @@ class EPMoE(nnx.Module):
         if x.shape[0] == 0:
             return jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
 
+        if os.environ.get("SGLANG_NAIVE_GMM", "0") == "1":
+            return self._naive_gmm_compute(x, group_sizes, w0_kernel, w1_kernel, wo_kernel, group_offset)
+
         group_sizes = group_sizes.astype(jnp.int32)
         act_q_dtype = self.activation_quantized_dtype
 
@@ -569,6 +572,20 @@ class EPMoE(nnx.Module):
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
+
+    def _naive_gmm_compute(self, x, group_sizes, w0, w1, wo, group_offset):
+        """Use GMM with interpret=True (CPU fallback) for debugging."""
+        group_sizes = group_sizes.astype(jnp.int32)
+        gmm_kwargs = dict(
+            group_sizes=group_sizes,
+            preferred_element_type=self.dtype,
+            group_offset=group_offset,
+            interpret=True,
+        )
+        layer_w0 = gmm(lhs=x, rhs=w0, zero_initialize=False, **gmm_kwargs)
+        layer_w1 = gmm(lhs=x, rhs=w1, zero_initialize=False, **gmm_kwargs)
+        intermediate = jax.nn.silu(layer_w0) * layer_w1
+        return gmm(lhs=intermediate, rhs=wo, zero_initialize=True, **gmm_kwargs)
 
     def _dispatch(self, group_sizes, expert_shard_id):
         if self.ep_size <= 1:
