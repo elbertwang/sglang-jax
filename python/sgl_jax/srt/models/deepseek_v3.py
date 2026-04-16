@@ -520,12 +520,10 @@ class DeepseekV3DecoderLayer(nnx.Module):
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
-            routed_output = self.mlp(hidden_states, topk_weights, topk_ids)
-
-            if _MOE_DEBUG and self.layer_id < 3:
-                # Can't use jax.debug.callback on multi-host TPU
-                # Instead, save debug tensors as model attributes for post-JIT inspection
-                pass
+            if os.environ.get("SGLANG_DISABLE_ROUTED", "0") == "1":
+                routed_output = jnp.zeros_like(shared_output)
+            else:
+                routed_output = self.mlp(hidden_states, topk_weights, topk_ids)
 
             hidden_states = routed_output + shared_output
         else:
