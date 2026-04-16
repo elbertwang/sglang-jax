@@ -57,28 +57,39 @@ _moe_debug_count = 0
 def _do_moe_fwd_debug(output, cache_miss_count):
     global _moe_debug_count
     _moe_debug_count += 1
-    if _moe_debug_count > 5:
+    if _moe_debug_count > 3:
         return
     try:
         logits = output.next_token_logits
         if logits is not None:
-            # Multi-host: use addressable_shards to get local data
-            shard = logits.addressable_shards[0]
-            logits_f32 = np.array(shard.data).astype(np.float32)
-            row = logits_f32[0] if logits_f32.ndim > 1 else logits_f32
-            top5_idx = np.argsort(row)[-5:][::-1]
-            top5_vals = row[top5_idx]
-            hogan_id = 142274
-            hogan_val = row[hogan_id] if len(row) > hogan_id else -999
+            # Check ALL addressable shards to find global max
+            shards = logits.addressable_shards
+            global_max_val = -1e9
+            global_max_shard = -1
+            global_max_local_idx = -1
+            vocab_per_shard = 0
+            for si, shard in enumerate(shards):
+                data = np.array(shard.data).astype(np.float32)
+                row = data[0] if data.ndim > 1 else data
+                vocab_per_shard = len(row)
+                local_max_idx = int(np.argmax(row))
+                local_max_val = float(row[local_max_idx])
+                if local_max_val > global_max_val:
+                    global_max_val = local_max_val
+                    global_max_shard = si
+                    global_max_local_idx = local_max_idx
+                if si < 2 or local_max_val > 10:
+                    logger.info(
+                        "LOGITS_SHARD s=%d max=%.4f argmax_local=%d mean=%.4f std=%.4f",
+                        si, local_max_val, local_max_idx, float(row.mean()), float(row.std()),
+                    )
+            global_max_global_idx = global_max_shard * vocab_per_shard + global_max_local_idx
             logger.info(
-                "LOGITS_DEBUG call=%d shape=%s mean=%f std=%f min=%f max=%f "
-                "top5_ids=%s top5_vals=%s hogan[%d]=%f miss=%d",
-                _moe_debug_count, str(logits_f32.shape),
-                logits_f32.mean(), logits_f32.std(),
-                logits_f32.min(), logits_f32.max(),
-                str(top5_idx.tolist()), str(top5_vals.tolist()),
-                hogan_id, hogan_val,
-                cache_miss_count,
+                "LOGITS_GLOBAL call=%d n_shards=%d vocab/shard=%d "
+                "winner_shard=%d winner_local=%d winner_global=%d winner_val=%.4f miss=%d",
+                _moe_debug_count, len(shards), vocab_per_shard,
+                global_max_shard, global_max_local_idx, global_max_global_idx,
+                global_max_val, cache_miss_count,
             )
     except Exception as e:
         logger.warning("LOGITS_DEBUG error: %s", e)
