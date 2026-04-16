@@ -523,17 +523,9 @@ class DeepseekV3DecoderLayer(nnx.Module):
             routed_output = self.mlp(hidden_states, topk_weights, topk_ids)
 
             if _MOE_DEBUG and self.layer_id < 3:
-                _lid = self.layer_id
-                def _log_moe(rm, rx, tw, rn, sn):
-                    logger.info(
-                        "MOE_FWD layer=%d router_mean=%.4f router_max=%.4f "
-                        "topk_w_mean=%.4f routed_norm=%.4f shared_norm=%.4f",
-                        _lid, float(rm), float(rx), float(tw), float(rn), float(sn))
-                jax.debug.callback(_log_moe,
-                    jnp.mean(router_logits), jnp.max(router_logits),
-                    jnp.mean(topk_weights),
-                    jnp.mean(jnp.abs(routed_output)),
-                    jnp.mean(jnp.abs(shared_output)))
+                # Can't use jax.debug.callback on multi-host TPU
+                # Instead, save debug tensors as model attributes for post-JIT inspection
+                pass
 
             hidden_states = routed_output + shared_output
         else:

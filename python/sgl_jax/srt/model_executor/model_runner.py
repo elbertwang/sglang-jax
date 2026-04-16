@@ -62,7 +62,6 @@ def _do_moe_fwd_debug(output, cache_miss_count):
     try:
         logits = output.next_token_logits
         if logits is not None:
-            # Check ALL addressable shards to find global max
             shards = logits.addressable_shards
             global_max_val = -1e9
             global_max_shard = -1
@@ -78,18 +77,23 @@ def _do_moe_fwd_debug(output, cache_miss_count):
                     global_max_val = local_max_val
                     global_max_shard = si
                     global_max_local_idx = local_max_idx
-                if si < 2 or local_max_val > 10:
-                    logger.info(
-                        "LOGITS_SHARD s=%d max=%.4f argmax_local=%d mean=%.4f std=%.4f",
-                        si, local_max_val, local_max_idx, float(row.mean()), float(row.std()),
-                    )
             global_max_global_idx = global_max_shard * vocab_per_shard + global_max_local_idx
+            # Also check: are ALL shards producing identical distributions?
+            s0 = np.array(shards[0].data).astype(np.float32)
+            s1 = np.array(shards[1].data).astype(np.float32)
+            s0r = s0[0] if s0.ndim > 1 else s0
+            s1r = s1[0] if s1.ndim > 1 else s1
+            # Compare first few values to check if shards are truly different
             logger.info(
                 "LOGITS_GLOBAL call=%d n_shards=%d vocab/shard=%d "
-                "winner_shard=%d winner_local=%d winner_global=%d winner_val=%.4f miss=%d",
+                "winner_shard=%d winner_global=%d winner_val=%.4f "
+                "s0_first5=%s s1_first5=%s s0_mean=%.4f s1_mean=%.4f miss=%d",
                 _moe_debug_count, len(shards), vocab_per_shard,
-                global_max_shard, global_max_local_idx, global_max_global_idx,
-                global_max_val, cache_miss_count,
+                global_max_shard, global_max_global_idx, global_max_val,
+                str([round(float(v), 3) for v in s0r[:5]]),
+                str([round(float(v), 3) for v in s1r[:5]]),
+                float(s0r.mean()), float(s1r.mean()),
+                cache_miss_count,
             )
     except Exception as e:
         logger.warning("LOGITS_DEBUG error: %s", e)
