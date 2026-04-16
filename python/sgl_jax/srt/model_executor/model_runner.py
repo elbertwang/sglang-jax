@@ -64,16 +64,20 @@ def _do_moe_fwd_debug(output, cache_miss_count):
         if logits is not None:
             # Multi-host: use addressable_shards to get local data
             shard = logits.addressable_shards[0]
-            logits_np = np.array(shard.data)
-            top5_idx = np.argsort(logits_np[0])[-5:][::-1]
-            top5_vals = logits_np[0][top5_idx]
+            logits_f32 = np.array(shard.data).astype(np.float32)
+            row = logits_f32[0] if logits_f32.ndim > 1 else logits_f32
+            top5_idx = np.argsort(row)[-5:][::-1]
+            top5_vals = row[top5_idx]
+            hogan_id = 142274
+            hogan_val = row[hogan_id] if len(row) > hogan_id else -999
             logger.info(
-                "LOGITS_DEBUG call=%d shard_shape=%s dtype=%s mean=%.4f std=%.4f "
-                "min=%.4f max=%.4f top5_ids=%s top5_vals=%s cache_miss=%d",
-                _moe_debug_count, logits_np.shape, logits_np.dtype,
-                float(logits_np.mean()), float(logits_np.std()),
-                float(logits_np.min()), float(logits_np.max()),
-                top5_idx.tolist(), [f"{v:.2f}" for v in top5_vals],
+                "LOGITS_DEBUG call=%d shape=%s mean=%f std=%f min=%f max=%f "
+                "top5_ids=%s top5_vals=%s hogan[%d]=%f miss=%d",
+                _moe_debug_count, str(logits_f32.shape),
+                logits_f32.mean(), logits_f32.std(),
+                logits_f32.min(), logits_f32.max(),
+                str(top5_idx.tolist()), str(top5_vals.tolist()),
+                hogan_id, hogan_val,
                 cache_miss_count,
             )
     except Exception as e:
