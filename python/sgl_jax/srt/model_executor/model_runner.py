@@ -60,14 +60,15 @@ def _do_moe_fwd_debug(output, cache_miss_count):
     if _moe_debug_count > 5:
         return
     try:
-        # output is LogitsProcessorOutput — check logits
         logits = output.next_token_logits
         if logits is not None:
-            logits_np = np.array(logits)
+            # Multi-host: use addressable_shards to get local data
+            shard = logits.addressable_shards[0]
+            logits_np = np.array(shard.data)
             top5_idx = np.argsort(logits_np[0])[-5:][::-1]
             top5_vals = logits_np[0][top5_idx]
             logger.info(
-                "LOGITS_DEBUG call=%d shape=%s dtype=%s mean=%.4f std=%.4f "
+                "LOGITS_DEBUG call=%d shard_shape=%s dtype=%s mean=%.4f std=%.4f "
                 "min=%.4f max=%.4f top5_ids=%s top5_vals=%s cache_miss=%d",
                 _moe_debug_count, logits_np.shape, logits_np.dtype,
                 float(logits_np.mean()), float(logits_np.std()),
