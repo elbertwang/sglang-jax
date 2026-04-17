@@ -1337,6 +1337,18 @@ class WeightLoader:
                         expert_weights.shape,
                     )
 
+        # Materialize any remaining ShapeDtypeStruct tracers (e.g., missing biases in HF checkpoint)
+        def materialize_struct(x):
+            if isinstance(x, jax.ShapeDtypeStruct):
+                sharding = getattr(x, "sharding", None)
+                arr = jnp.zeros(x.shape, dtype=x.dtype)
+                if sharding is not None:
+                    return jax.device_put(arr, sharding)
+                return arr
+            return x
+
+        params = jax.tree_util.tree_map(materialize_struct, params)
+
         nnx.update(self.model, params)
         logger.info("All weights loaded successfully.")
 
