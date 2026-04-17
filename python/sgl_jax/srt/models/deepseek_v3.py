@@ -526,14 +526,6 @@ class DeepseekV3DecoderLayer(nnx.Module):
                 routed_output = self.mlp(hidden_states, topk_weights, topk_ids)
 
             hidden_states = routed_output + shared_output
-
-            if _MOE_DEBUG and self.layer_id < 3:
-                # Compute norms AFTER addition (hidden_states is on model mesh)
-                _lid = self.layer_id
-                combined_norm = jnp.mean(jnp.abs(hidden_states))
-                def _log_norms(cn):
-                    logger.info("MOE_NORMS layer=%d combined_norm=%.6f", _lid, float(cn))
-                jax.experimental.io_callback(_log_norms, None, combined_norm)
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = jnp.zeros((hidden_states.shape[0], 1), dtype=jnp.int32)

@@ -99,6 +99,48 @@ def _do_moe_fwd_debug(output, cache_miss_count):
         logger.warning("LOGITS_DEBUG error: %s", e)
 
 
+def _test_expert_matmul(runner):
+    """Test expert computation directly with jnp.dot vs GMM to find discrepancy."""
+    try:
+        from flax import nnx
+        model_state = nnx.state(nnx.merge(runner.model_def, nnx.State(
+            jax.tree_util.tree_unflatten(runner.model_state_def, runner.model_state_leaves))))
+
+        # Find first MoE layer's expert weights
+        first_k = 1  # first_k_dense_replace=1 for K2-Thinking
+        layer_key = f'model.layers.{first_k}'
+
+        # Get expert weights (wi_0 = gate_proj, shape [experts, hidden, intermediate])
+        wi0 = None
+        for path, val in jax.tree_util.tree_leaves_with_path(model_state):
+            path_str = '.'.join(str(p) for p in path)
+            if f'layers.{first_k}' in path_str and 'wi_0' in path_str and 'scale' not in path_str:
+                wi0_shard = val.value.addressable_shards[0]
+                wi0_local = np.array(wi0_shard.data).astype(np.float32)
+                logger.info("EXPERT_TEST wi0 shard shape=%s dtype=%s mean_abs=%.6f",
+                           wi0_local.shape, wi0_local.dtype, np.abs(wi0_local).mean())
+
+                # Create test input (ones vector)
+                hidden_size = wi0_local.shape[1]
+                test_input = np.ones((1, hidden_size), dtype=np.float32) * 0.01
+
+                # Compute expert 0's gate projection
+                expert0_w = wi0_local[0]  # [hidden, intermediate_shard]
+                result = test_input @ expert0_w
+                logger.info("EXPERT_TEST expert0_gate: input_norm=%.4f output_shape=%s "
+                           "output_mean=%.6f output_std=%.6f output_max=%.4f",
+                           np.abs(test_input).mean(), result.shape,
+                           result.mean(), result.std(), np.abs(result).max())
+                break
+
+        if wi0 is None and wi0_local is not None:
+            logger.info("EXPERT_TEST completed successfully")
+        else:
+            logger.info("EXPERT_TEST wi0 not found")
+    except Exception as e:
+        logger.warning("EXPERT_TEST error: %s", e)
+
+
 class ModelRunner(BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
 
@@ -647,16 +689,8 @@ class ModelRunner(BaseModelRunner):
 
         if os.environ.get("SGLANG_MOE_DEBUG") == "1":
             _do_moe_fwd_debug(output, cache_miss_count)
-            # Check per-layer hidden state norms (saved by model during forward pass)
-            if hasattr(self, 'model') and hasattr(self.model, 'model') and hasattr(self.model.model, '_debug_norms'):
-                try:
-                    norms = self.model.model._debug_norms
-                    shard = norms.addressable_shards[0]
-                    norms_np = np.array(shard.data).astype(np.float32)
-                    logger.info("LAYER_NORMS call=%d values=%s", _moe_debug_count,
-                                str([round(float(v), 4) for v in norms_np]))
-                except Exception as e:
-                    logger.warning("LAYER_NORMS error: %s", e)
+            if _moe_debug_count == 1:
+                _test_expert_matmul(self)
 
         self._set_kv_cache_after_forward(layers_kv_fused)
 
