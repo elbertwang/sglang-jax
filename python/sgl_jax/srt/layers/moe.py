@@ -519,6 +519,17 @@ class EPMoE(nnx.Module):
         if hidden_states.ndim != 2:
             hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
 
+        if os.environ.get("SGLANG_NAIVE_MOE_EXPERT0_ONLY", "0") == "1":
+            # Test: use ONLY expert 0 with weight 1, no routing
+            # If diverse: routing is bug. If Hogan: expert weights are wrong.
+            gate = jnp.dot(hidden_states, w0[0])
+            up = jnp.dot(hidden_states, w1[0])
+            intermediate = jax.nn.silu(gate) * up
+            out = jnp.dot(intermediate, wo[0])
+            if self.tp_size > 1:
+                out = jax.lax.psum(out, "tensor")
+            return out
+
         T = hidden_states.shape[0]
         H = hidden_states.shape[1]
         local_E = w0.shape[0]
