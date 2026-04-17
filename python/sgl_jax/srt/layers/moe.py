@@ -388,6 +388,17 @@ class EPMoE(nnx.Module):
         # Activation quantization is now handled per-GEMM inside _gmm_compute
         # (aligned with sglang-gpu scheme: quantize before each GEMM, dequantize after)
 
+        if os.environ.get("SGLANG_BYPASS_SHARD_MAP", "0") == "1":
+            # DIRECT compute outside shard_map: use ONLY expert 0, weight=1
+            # Tests if shard_map / reshard is the bug
+            w0_e0 = self.wi_0.value[0]  # (hidden, intermediate)
+            w1_e0 = self.wi_1.value[0]
+            wo_e0 = self.wo.value[0]
+            gate = jnp.dot(hidden_states, w0_e0)
+            up = jnp.dot(hidden_states, w1_e0)
+            intermediate = jax.nn.silu(gate) * up
+            return jnp.dot(intermediate, wo_e0)
+
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
