@@ -100,43 +100,31 @@ def _do_moe_fwd_debug(output, cache_miss_count):
 
 
 def _test_expert_matmul(runner):
-    """Test expert computation directly with jnp.dot vs GMM to find discrepancy."""
+    """Test expert weight values by inspecting model_state_leaves directly."""
     try:
-        from flax import nnx
-        model_state = nnx.state(nnx.merge(runner.model_def, nnx.State(
-            jax.tree_util.tree_unflatten(runner.model_state_def, runner.model_state_leaves))))
+        leaves = runner.model_state_leaves
+        tree_def = runner.model_state_def
+        # Get leaf paths
+        paths = jax.tree_util.tree_unflatten(tree_def,
+            list(range(len(leaves))))
 
-        # Find first MoE layer's expert weights
-        first_k = 1  # first_k_dense_replace=1 for K2-Thinking
-        layer_key = f'model.layers.{first_k}'
-
-        # Get expert weights (wi_0 = gate_proj, shape [experts, hidden, intermediate])
-        wi0 = None
-        for path, val in jax.tree_util.tree_leaves_with_path(model_state):
-            path_str = '.'.join(str(p) for p in path)
-            if f'layers.{first_k}' in path_str and 'wi_0' in path_str and 'scale' not in path_str:
-                wi0_shard = val.value.addressable_shards[0]
-                wi0_local = np.array(wi0_shard.data).astype(np.float32)
-                logger.info("EXPERT_TEST wi0 shard shape=%s dtype=%s mean_abs=%.6f",
-                           wi0_local.shape, wi0_local.dtype, np.abs(wi0_local).mean())
-
-                # Create test input (ones vector)
-                hidden_size = wi0_local.shape[1]
-                test_input = np.ones((1, hidden_size), dtype=np.float32) * 0.01
-
-                # Compute expert 0's gate projection
-                expert0_w = wi0_local[0]  # [hidden, intermediate_shard]
-                result = test_input @ expert0_w
-                logger.info("EXPERT_TEST expert0_gate: input_norm=%.4f output_shape=%s "
-                           "output_mean=%.6f output_std=%.6f output_max=%.4f",
-                           np.abs(test_input).mean(), result.shape,
-                           result.mean(), result.std(), np.abs(result).max())
+        # Search for wi_0 (gate_proj expert weight) in first MoE layer
+        for idx, leaf in enumerate(leaves):
+            if not hasattr(leaf, 'shape') or leaf.ndim != 3:
+                continue
+            # Expert weights are 3D: (num_experts, dim1, dim2)
+            if leaf.shape[0] > 100 and leaf.shape[1] > 1000:  # likely expert weight
+                shard = leaf.addressable_shards[0]
+                data = np.array(shard.data).astype(np.float32)
+                logger.info(
+                    "EXPERT_TEST leaf=%d global_shape=%s shard_shape=%s "
+                    "mean_abs=%.6f std=%.6f max=%.4f expert0_col0_first5=%s",
+                    idx, leaf.shape, data.shape,
+                    np.abs(data).mean(), data.std(), np.abs(data).max(),
+                    str([round(float(v), 4) for v in data[0, :5, 0]]),
+                )
+                # Only check first expert weight found
                 break
-
-        if wi0 is None and wi0_local is not None:
-            logger.info("EXPERT_TEST completed successfully")
-        else:
-            logger.info("EXPERT_TEST wi0 not found")
     except Exception as e:
         logger.warning("EXPERT_TEST error: %s", e)
 
