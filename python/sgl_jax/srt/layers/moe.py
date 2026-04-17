@@ -538,12 +538,16 @@ class EPMoE(nnx.Module):
             out_acc = carry
             global_e = local_offset + e_local
             # Compute this expert's FFN for ALL tokens
-            gate = jnp.dot(hidden_states, w0[e_local])  # (T, I_local)
-            up = jnp.dot(hidden_states, w1[e_local])     # (T, I_local)
+            w0_e = jax.lax.dynamic_index_in_dim(w0, e_local, 0, keepdims=False)
+            w1_e = jax.lax.dynamic_index_in_dim(w1, e_local, 0, keepdims=False)
+            wo_e = jax.lax.dynamic_index_in_dim(wo, e_local, 0, keepdims=False)
+            gate = jnp.dot(hidden_states, w0_e)         # (T, I_local)
+            up = jnp.dot(hidden_states, w1_e)            # (T, I_local)
             intermediate = jax.nn.silu(gate) * up        # (T, I_local)
-            out_e = jnp.dot(intermediate, wo[e_local])   # (T, H) — partial across TP
+            out_e = jnp.dot(intermediate, wo_e)          # (T, H) — partial across TP
             # Apply per-token weight (0 if not selected)
-            w_te = expert_weights_TE[:, global_e:global_e + 1]
+            # Use dynamic slice for tracer-indexed column extraction
+            w_te = jax.lax.dynamic_slice_in_dim(expert_weights_TE, global_e, 1, axis=1)
             out_acc = out_acc + w_te * out_e
             return out_acc, None
 
