@@ -454,6 +454,10 @@ class EPMoE(nnx.Module):
         w1_kernel_bias=None,
         wo_kernel_bias=None,
     ):
+        if os.environ.get("SGLANG_NAIVE_MOE", "0") == "1":
+            return self._naive_forward(hidden_states, topk_weights, topk_ids,
+                                       w0_weights, w1_weights, wo_weights)
+
         expert_shard_id = jax.lax.axis_index("expert")
 
         if hidden_states.ndim == 2:
@@ -500,6 +504,56 @@ class EPMoE(nnx.Module):
             output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
             output = self._combine(output)
+
+        return output
+
+    def _naive_forward(self, hidden_states, topk_weights, topk_ids, w0, w1, wo):
+        """Naive scan-based MoE: bypasses GMM kernel + permute/unpermute.
+
+        Iterates over local experts with scan, computes FFN for ALL tokens per expert,
+        masks by per-token-per-expert weight, accumulates. Slow but provably correct.
+
+        Inside shard_map context: w0/w1/wo are local shards (experts_per_device, k, n).
+        With EP=1, all experts local. Output is partial-summed across TP, then psum'd.
+        """
+        if hidden_states.ndim != 2:
+            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+
+        T = hidden_states.shape[0]
+        H = hidden_states.shape[1]
+        local_E = w0.shape[0]
+        E_total = self.num_experts
+
+        # Per-(token, global_expert) weight matrix: (T, E_total)
+        # one_hot_ids[t, k, e] = 1 if topk_ids[t,k]==e else 0
+        one_hot_ids = jax.nn.one_hot(topk_ids, E_total, dtype=topk_weights.dtype)
+        expert_weights_TE = jnp.einsum("tk,tke->te", topk_weights, one_hot_ids)
+        expert_weights_TE = expert_weights_TE.astype(self.dtype)
+
+        # Map global expert id to local index for this EP shard
+        expert_shard_id = jax.lax.axis_index("expert")
+        local_offset = expert_shard_id * local_E
+
+        def step(carry, e_local):
+            out_acc = carry
+            global_e = local_offset + e_local
+            # Compute this expert's FFN for ALL tokens
+            gate = jnp.dot(hidden_states, w0[e_local])  # (T, I_local)
+            up = jnp.dot(hidden_states, w1[e_local])     # (T, I_local)
+            intermediate = jax.nn.silu(gate) * up        # (T, I_local)
+            out_e = jnp.dot(intermediate, wo[e_local])   # (T, H) — partial across TP
+            # Apply per-token weight (0 if not selected)
+            w_te = expert_weights_TE[:, global_e:global_e + 1]
+            out_acc = out_acc + w_te * out_e
+            return out_acc, None
+
+        initial = jnp.zeros((T, H), dtype=self.dtype)
+        output, _ = jax.lax.scan(step, initial, jnp.arange(local_E))
+
+        if self.tp_size > 1:
+            output = jax.lax.psum(output, "tensor")
+        if self.ep_size > 1:
+            output = jax.lax.psum(output, "expert")
 
         return output
 
